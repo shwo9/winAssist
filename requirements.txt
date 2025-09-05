@@ -1,0 +1,8 @@
+customtkinter
+playwright
+requests
+playwright-stealth
+flask
+cryptography
+webbrowser
+pyjwt
