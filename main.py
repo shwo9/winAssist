@@ -231,6 +231,16 @@ class App(ctk.CTk):
         )
         self.send_button.grid(row=0, column=1, padx=(0, 20), pady=15)
 
+        # 로딩 인디케이터 (초기에는 숨김)
+        self.loading_label = ctk.CTkLabel(
+            self.bottom_frame,
+            text="",
+            font=("Segoe UI", 11),
+            text_color="#9ca3af"
+        )
+        self.loading_label.grid(row=0, column=2, padx=(0, 10), pady=15, sticky="e")
+        self._loading_anim_id = None
+
         # --- Load existing auth if present ---
         try:
             self.try_load_tokens()
@@ -355,6 +365,8 @@ class App(ctk.CTk):
             return
 
         with self.chat_lock:
+            # 채팅창 내 로딩 플레이스홀더 표시
+            self.after(0, self.start_stream_loading)
             if self.use_api_key:
                 # OpenAI API 키 방식
                 headers = {
@@ -618,7 +630,7 @@ class App(ctk.CTk):
                         except json.JSONDecodeError:
                             continue
 
-            self.after(0, lambda: self.textbox_append("\n"))
+            self.after(0, lambda: (self.finalize_stream_loading(),))
 
         except requests.RequestException as e:
             print(f"OpenAI API 요청 중 오류 발생: {e}")
@@ -676,7 +688,7 @@ class App(ctk.CTk):
                 msg = f"HTTP {response.status_code} {err_body[:500]}"  # 본문 일부만 표시
                 print(f"[Codex] 요청 실패: {msg}")
                 self.after(0, lambda m=msg: self.textbox_append(f"[오류] ChatGPT(Codex)와 통신 오류: {m}\n"))
-                self.after(0, lambda: self.send_button.configure(state="normal"))
+                self.after(0, lambda: (self.send_button.configure(state="normal"), self.finalize_stream_loading()))
                 return
 
             self.after(0, lambda: self.textbox_append("🤖 ChatGPT: "))
@@ -712,12 +724,12 @@ class App(ctk.CTk):
                 elif ev_type in ("response.completed", "response.error"):
                     break
 
-            self.after(0, lambda: self.textbox_append("\n"))
+            self.after(0, lambda: self.finalize_stream_loading())
 
         except requests.RequestException as e:
             msg = str(e)
             print(f"ChatGPT(Codex) 요청 중 오류 발생: {msg}")
-            self.after(0, lambda m=msg: self.textbox_append(f"[오류] ChatGPT(Codex)와 통신 중 문제가 발생했습니다: {m}\n"))
+            self.after(0, lambda m=msg: (self.textbox_append(f"[오류] ChatGPT(Codex)와 통신 중 문제가 발생했습니다: {m}\n"), self.finalize_stream_loading()))
         finally:
             self.after(0, lambda: self.send_button.configure(state="normal"))
 
@@ -778,6 +790,26 @@ class App(ctk.CTk):
         self.textbox.insert("end", text)
         self.textbox.configure(state="disabled")
         self.textbox.see("end")
+
+    # --- Loading indicator helpers ---
+    def start_stream_loading(self):
+        # 대화창에 로딩 플레이스홀더 추가하고 위치 저장
+        self._loading_marker_index = self.textbox.index("end-1c")
+        self.textbox_append("🤖 ChatGPT:  답변 생성중 ...\n")
+
+    def finalize_stream_loading(self):
+        # 로딩 텍스트를 제거하거나 개행만 남김
+        try:
+            if hasattr(self, "_loading_marker_index") and self._loading_marker_index:
+                # 로딩 라인 삭제 (마지막 줄 기준)
+                self.textbox.configure(state="normal")
+                last_line = int(float(self.textbox.index("end-1c").split(".")[0]))
+                self.textbox.delete(f"{last_line-1}.0", f"{last_line}.0")
+                self.textbox.configure(state="disabled")
+        except Exception:
+            pass
+        finally:
+            self._loading_marker_index = None
 
     def textbox_stream_update(self, text_chunk):
         self.textbox.configure(state="normal")
