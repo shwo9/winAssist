@@ -4,5 +4,6 @@ requests
 playwright-stealth
 flask
 cryptography
-webbrowser
 pyjwt
+keyboard
+pyperclip

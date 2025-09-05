@@ -17,6 +17,10 @@ from flask import Flask, request, redirect
 from urllib.parse import urlencode, urlparse, parse_qs
 from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
+import pyperclip
+import keyboard
+import ctypes
+from ctypes import wintypes
 
 # SSL 경고 억제 (회사 환경 대응)
 warnings.filterwarnings('ignore', message='Unverified HTTPS request')
@@ -66,6 +70,8 @@ class App(ctk.CTk):
         self.oauth_server = None
         self.oauth_thread = None
         self._codex_base_instructions_cache = None
+        self.config_store_path = os.path.join(os.path.expanduser("~"), ".winai", "config.json")
+        self.hotkey = "ctrl+shift+z"
 
         # --- Layout Configuration ---
         self.grid_columnconfigure(0, weight=1)
@@ -241,11 +247,26 @@ class App(ctk.CTk):
         self.loading_label.grid(row=0, column=2, padx=(0, 10), pady=15, sticky="e")
         self._loading_anim_id = None
 
+        # --- Load config & register hotkey ---
+        try:
+            self.load_config()
+        except Exception as e:
+            print(f"[Config] 초기 로드 실패: {e}")
+        try:
+            self.register_global_hotkey()
+            # Windows 네이티브 글로벌 핫키도 등록 (보다 신뢰성 높음)
+            self.register_global_hotkey_win()
+        except Exception as e:
+            print(f"[Hotkey] 등록 실패: {e}")
+
         # --- Load existing auth if present ---
         try:
             self.try_load_tokens()
         except Exception as init_load_error:
             print(f"[Auth] 초기 토큰 로드 실패: {init_load_error}")
+
+        # 안전한 종료 핸들러
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # --- Auth persistence/helpers ---
     def ensure_auth_dir(self):
@@ -629,7 +650,7 @@ class App(ctk.CTk):
                                         full_response += chunk
                         except json.JSONDecodeError:
                             continue
-
+                
             self.after(0, lambda: (self.finalize_stream_loading(),))
 
         except requests.RequestException as e:
@@ -824,6 +845,178 @@ class App(ctk.CTk):
     def reset_login_ui(self):
         self.status_label.configure(text="🔴 상태: 세션 연결 실패", text_color="#f87171")
         self.login_button.configure(state="normal")
+
+    # --- Config / Hotkey ---
+    def load_config(self):
+        cfg_dir = os.path.dirname(self.config_store_path)
+        if not os.path.isdir(cfg_dir):
+            os.makedirs(cfg_dir, exist_ok=True)
+        if os.path.isfile(self.config_store_path):
+            with open(self.config_store_path, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+            hk = cfg.get('hotkey')
+            if isinstance(hk, str) and hk.strip():
+                self.hotkey = hk.strip()
+        else:
+            self.save_config()
+
+    def save_config(self):
+        cfg = { 'hotkey': self.hotkey }
+        with open(self.config_store_path, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+    def register_global_hotkey(self):
+        # 기존 등록 제거 후 재등록
+        try:
+            keyboard.remove_hotkey(self.hotkey)
+        except Exception:
+            pass
+        keyboard.add_hotkey(self.hotkey, lambda: self.after(0, self.on_quick_capture_hotkey))
+        print(f"[Hotkey] 등록됨: {self.hotkey}")
+
+    # ---- Windows 네이티브 글로벌 핫키 ----
+    def _parse_hotkey_to_win(self, hotkey_str: str):
+        # 지원: ctrl, shift, alt + 단일키 (예: 'ctrl+shift+z')
+        parts = [p.strip().lower() for p in hotkey_str.split('+') if p.strip()]
+        mods = 0
+        key = None
+        MOD_ALT = 0x0001
+        MOD_CONTROL = 0x0002
+        MOD_SHIFT = 0x0004
+        for p in parts:
+            if p in ("ctrl", "control"):
+                mods |= MOD_CONTROL
+            elif p == "shift":
+                mods |= MOD_SHIFT
+            elif p in ("alt",):
+                mods |= MOD_ALT
+            else:
+                key = p
+        if key is None or len(key) == 0:
+            key = 'z'
+        # 가급적 가상키 코드 계산
+        vk = ord(key.upper()[0])
+        return mods, vk
+
+    def register_global_hotkey_win(self):
+        try:
+            self._user32 = ctypes.windll.user32
+            self._WM_HOTKEY = 0x0312
+            mods, vk = self._parse_hotkey_to_win(self.hotkey)
+            # id 1 사용 (충돌 시 증가 가능)
+            if not self._user32.RegisterHotKey(None, 1, mods, vk):
+                print("[Hotkey][Win] RegisterHotKey 실패 (이미 등록되었을 수 있음)")
+                return
+            print("[Hotkey][Win] RegisterHotKey 성공")
+            # 메시지 루프 스레드 시작
+            th = threading.Thread(target=self._win_hotkey_loop, daemon=True)
+            th.start()
+            self._hotkey_win_registered = True
+        except Exception as e:
+            print(f"[Hotkey][Win] 등록 오류: {e}")
+            self._hotkey_win_registered = False
+
+    def _win_hotkey_loop(self):
+        msg = wintypes.MSG()
+        while True:
+            b = self._user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+            if b == 0:  # WM_QUIT
+                break
+            if msg.message == self._WM_HOTKEY:
+                # Tk 메인스레드에서 처리
+                try:
+                    self.after(0, self.on_quick_capture_hotkey)
+                except Exception:
+                    pass
+            self._user32.TranslateMessage(ctypes.byref(msg))
+            self._user32.DispatchMessageW(ctypes.byref(msg))
+
+    def on_quick_capture_hotkey(self):
+        # 드래그 텍스트를 복사하여 가져오기 시도: Ctrl+C 시도 후 클립보드 읽기
+        try:
+            keyboard.send('ctrl+c')
+            self.after(100, self._open_quick_input_from_clipboard)
+        except Exception as e:
+            print(f"[Hotkey] 캡처 중 오류: {e}")
+
+    def _open_quick_input_from_clipboard(self):
+        try:
+            selected_text = pyperclip.paste() or ""
+        except Exception:
+            selected_text = ""
+        self.open_quick_input_window(selected_text)
+
+    def open_quick_input_window(self, selected_text: str):
+        if hasattr(self, '_quick_win') and self._quick_win is not None:
+            try:
+                self._quick_win.destroy()
+            except Exception:
+                pass
+        self._quick_selected = selected_text.strip()
+        self._quick_win = ctk.CTkToplevel(self)
+        self._quick_win.title("🔍 Quick Ask")
+        self._quick_win.attributes('-topmost', True)
+        self._quick_win.configure(fg_color="#2b2b2b")
+        self._quick_win.geometry("420x160+100+100")
+
+        label = ctk.CTkLabel(self._quick_win, text="선택한 텍스트", text_color="#9ca3af")
+        label.pack(padx=12, pady=(12, 6), anchor='w')
+
+        preview = ctk.CTkTextbox(self._quick_win, height=50)
+        preview.pack(padx=12, fill='x')
+        preview.insert('end', (self._quick_selected[:500] + ('…' if len(self._quick_selected) > 500 else '')) or '(없음)')
+        preview.configure(state='disabled')
+
+        ask_label = ctk.CTkLabel(self._quick_win, text="질문 입력", text_color="#9ca3af")
+        ask_label.pack(padx=12, pady=(10, 6), anchor='w')
+
+        self._quick_entry = ctk.CTkEntry(self._quick_win, placeholder_text="이 텍스트에 대해 무엇을 할까요? (번역/요약/설명 등)")
+        self._quick_entry.pack(padx=12, fill='x')
+        self._quick_entry.bind('<Return>', self._submit_quick_input)
+
+        btn_frame = ctk.CTkFrame(self._quick_win, fg_color='transparent')
+        btn_frame.pack(padx=12, pady=12, fill='x')
+        send_btn = ctk.CTkButton(btn_frame, text="📤 전송", command=self._submit_quick_input)
+        send_btn.pack(side='right')
+
+    def _submit_quick_input(self, event=None):
+        try:
+            question = self._quick_entry.get().strip() if hasattr(self, '_quick_entry') else ''
+        except Exception:
+            question = ''
+        if not self._quick_selected and not question:
+            return
+        # 메시지 구성: 선택 텍스트를 블록으로 제공하고 사용자 요청을 이어 붙임
+        parts = []
+        if self._quick_selected:
+            parts.append(f"[선택 텍스트]\n{self._quick_selected}\n")
+        if question:
+            parts.append(f"[요청]\n{question}")
+        merged = "\n\n".join(parts)
+        # 대화창에도 사용자 메시지로 반영
+        self.textbox_append(f"👤 나: {question or '(선택 텍스트에 대한 요청)'}\n\n")
+        if hasattr(self, '_quick_win') and self._quick_win is not None:
+            try:
+                self._quick_win.destroy()
+            except Exception:
+                pass
+            self._quick_win = None
+        # 기존 전송 로직 재사용
+        t = threading.Thread(target=self.send_message_request, args=(merged,))
+        t.daemon = True
+        t.start()
+
+    def on_close(self):
+        try:
+            keyboard.unhook_all_hotkeys()
+        except Exception:
+            pass
+        try:
+            if getattr(self, '_hotkey_win_registered', False):
+                self._user32.UnregisterHotKey(None, 1)
+        except Exception:
+            pass
+        self.destroy()
 
 if __name__ == "__main__":
     app = App()
