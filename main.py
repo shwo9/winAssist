@@ -59,6 +59,8 @@ class App(ctk.CTk):
         # --- Auth persistence ---
         self.auth_store_path = os.path.join(os.path.expanduser("~"), ".winai", "auth.json")
         self.chatgpt_account_id = None
+        # 사용자 instructions 파일은 사용하지 않음 (Codex BASE만 사용)
+        self.instructions_store_path = None
 
         # --- Flask OAuth Server ---
         self.oauth_server = None
@@ -337,7 +339,7 @@ class App(ctk.CTk):
         user_input = self.entry.get().strip()
         if not user_input:
             return
-
+        
         self.textbox_append(f"👤 나: {user_input}\n\n")
         self.entry.delete(0, "end")
         self.send_button.configure(state="disabled")
@@ -593,7 +595,7 @@ class App(ctk.CTk):
         try:
             response = requests.post(url, headers=headers, json=data, stream=True, timeout=120, verify=False)
             response.raise_for_status()
-            
+
             full_response = ""
             self.after(0, lambda: self.textbox_append("🤖 ChatGPT: "))
 
@@ -615,7 +617,7 @@ class App(ctk.CTk):
                                         full_response += chunk
                         except json.JSONDecodeError:
                             continue
-            
+
             self.after(0, lambda: self.textbox_append("\n"))
 
         except requests.RequestException as e:
@@ -629,12 +631,16 @@ class App(ctk.CTk):
             headers = self.captured_headers.copy()
             headers['Content-Type'] = 'application/json'
             headers['Accept'] = 'text/event-stream'
+            # Codex CLI가 추가하는 계정 헤더를 보강
+            if self.chatgpt_account_id and 'chatgpt-account-id' not in headers:
+                headers['chatgpt-account-id'] = self.chatgpt_account_id
             headers['OpenAI-Beta'] = 'responses=experimental'
-            headers['originator'] = 'codex_cli_rs'
-            headers['version'] = '0.20.0'
+            headers['originator'] = 'codex-cli'
+            headers['version'] = '1.0.0'
             session_id = str(uuid.uuid4())
             headers['session_id'] = session_id
 
+            # Codex 요청 페이로드 (필드 복원)
             data = {
                 "model": "gpt-5",
                 "instructions": self.load_codex_base_instructions(),
@@ -718,7 +724,8 @@ class App(ctk.CTk):
     def load_codex_base_instructions(self) -> str:
         if self._codex_base_instructions_cache:
             return self._codex_base_instructions_cache
-        # Codex의 BASE_INSTRUCTIONS와 최대한 동일하게 사용
+        # 1) Codex의 BASE_INSTRUCTIONS 로드
+        base_content = ""
         candidate_paths = [
             os.path.join(os.getcwd(), 'codex', 'codex-rs', 'core', 'prompt.md'),
             os.path.join(os.path.dirname(__file__), 'codex', 'codex-rs', 'core', 'prompt.md')
@@ -729,102 +736,25 @@ class App(ctk.CTk):
                     with open(path, 'r', encoding='utf-8') as f:
                         content = f.read()
                         if content.strip():
-                            self._codex_base_instructions_cache = content
-                            return content
+                            base_content = content
+                            print(f"[Codex] BASE_INSTRUCTIONS 로드됨: {path}")
+                            break
             except Exception as e:
                 print(f"[Codex] instructions 로드 실패({path}): {e}")
-        # Codex의 실제 instructions를 하드코딩으로 사용 (파일이 없을 경우)
-        print("[Codex] 하드코딩된 실제 instructions 사용")
-        real_codex_instructions = """
-        AI Assistant Instruction (PC Environment)
+        # 사용자 instructions는 무시하고 Codex BASE만 사용
+        if base_content:
+            combined = base_content
+        else:
+            # 최종 폴백 (BASE가 없을 때만)
+            print("[Codex] BASE_INSTRUCTIONS를 찾지 못해 최소 폴백 사용")
+            combined = "You are a coding assistant. Be accurate, concise, and helpful."
 
-        You are an AI Assistant running on a PC environment.
-        You should always respond in a way that is accurate, friendly, and helpful.
+        self._codex_base_instructions_cache = combined
+        return combined
 
-        Personality
-
-        Tone is concise, direct, and approachable.
-
-        Always communicate clearly so the user can easily understand.
-
-        Avoid unnecessary verbosity and focus on the core information.
-
-        Responsiveness
-
-        Always try to fully resolve the user’s request.
-
-        Provide a short guiding message before results when helpful.
-
-        Suggest simple next steps or ways to use the result.
-
-        Final Answer Style
-
-        Keep the format simple and easy to scan.
-
-        Use Markdown structure (lists, emphasis, etc.) when needed.
-
-        Present results in a clear and intuitive way."""
-# """You are a coding agent running in the Codex CLI, a terminal-based coding assistant. Codex CLI is an open source project led by OpenAI. You are expected to be precise, safe, and helpful.
-
-# Your capabilities:
-
-# - Receive user prompts and other context provided by the harness, such as files in the workspace.
-# - Communicate with the user by streaming thinking & responses, and by making & updating plans.
-# - Emit function calls to run terminal commands and apply patches. Depending on how this specific run is configured, you can request that these function calls be escalated to the user for approval before running. More on this in the "Sandbox and approvals" section.
-
-# Within this context, Codex refers to the open-source agentic coding interface (not the old Codex language model built by OpenAI).
-
-# # How you work
-
-# ## Personality
-
-# Your default personality and tone is concise, direct, and friendly. You communicate efficiently, always keeping the user clearly informed about ongoing actions without unnecessary detail. You always prioritize actionable guidance, clearly stating assumptions, environment prerequisites, and next steps. Unless explicitly asked, you avoid excessively verbose explanations about your work.
-
-# ## Responsiveness
-
-# ### Preamble messages
-
-# Before making tool calls, send a brief preamble to the user explaining what you're about to do. When sending preamble messages, follow these principles and examples:
-
-# - **Logically group related actions**: if you're about to run several related commands, describe them together in one preamble rather than sending a separate note for each.
-# - **Keep it concise**: be no more than 1-2 sentences, focused on immediate, tangible next steps. (8-12 words for quick updates).
-# - **Build on prior context**: if this is not your first tool call, use the preamble message to connect the dots with what's been done so far and create a sense of momentum and clarity for the user to understand your next actions.
-# - **Keep your tone light, friendly and curious**: add small touches of personality in preambles feel collaborative and engaging.
-# - **Exception**: Avoid adding a preamble for every trivial read (e.g., `cat` a single file) unless it's part of a larger grouped action.
-
-# ## Task execution
-
-# You are a coding agent. Please keep going until the query is completely resolved, before ending your turn and yielding back to the user. Only terminate your turn when you are sure that the problem is solved. Autonomously resolve the query to the best of your ability, using the tools available to you, before coming back to the user. Do NOT guess or make up an answer.
-
-# ## Sandbox and approvals
-
-# The Codex CLI harness supports several different sandboxing, and approval configurations that the user can choose from.
-
-# Filesystem sandboxing prevents you from editing files without user approval. The options are:
-
-# - **read-only**: You can only read files.
-# - **workspace-write**: You can read files. You can write to files in your workspace folder, but not outside it.
-# - **danger-full-access**: No filesystem sandboxing.
-
-# Network sandboxing prevents you from accessing network without approval. Options are
-
-# - **restricted**
-# - **enabled**
-
-# Approvals are your mechanism to get user consent to perform more privileged actions. Although they introduce friction to the user because your work is paused until the user responds, you should leverage them to accomplish your important work. Do not let these settings or the sandbox deter you from attempting to accomplish the user's task.
-
-# ## Validating your work
-
-# If the codebase has tests or the ability to build or run, consider using them to verify that your work is complete.
-
-# When testing, your philosophy should be to start as specific as possible to the code you changed so that you can catch issues efficiently, then make your way to broader tests as you build confidence.
-
-# ## Final answer structure and style guidelines
-
-# You are producing plain text that will later be styled by the CLI. Follow these rules exactly. Formatting should make results easy to scan, but not feel mechanical. Use judgment to decide how much structure adds value."""
-
-        self._codex_base_instructions_cache = real_codex_instructions
-        return real_codex_instructions
+    def ensure_default_instructions_file(self):
+        """(비활성) 사용자 instructions 파일은 사용하지 않음"""
+        return
 
     # --- GUI Helpers ---
     def save_conversation(self):
